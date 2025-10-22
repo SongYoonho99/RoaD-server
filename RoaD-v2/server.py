@@ -13,7 +13,7 @@ import pymysql
 # ==============================
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 
-host = 'localhost'
+host = os.getenv('ROAD2_DB_HOST')
 user = os.getenv('ROAD2_DB_USER')
 password = os.getenv('ROAD2_DB_PASSWORD')
 name = os.getenv('ROAD2_DB_NAME')
@@ -148,11 +148,39 @@ def login(conn):
                 'dayword': dayword,
                 'category': category,
                 'today_word': today_word,
-                'check_streak': check_streak
+                'streak': check_streak
             }), 201
     # 로그인 실패 시
     else:
         return jsonify({'message': 'ID not found'}), 400
+
+@app.route('/take_more_word', methods=['POST'])
+@handle_server_errors
+def take_more_word(conn):
+    '''오늘의 단어가 부족할때 추가로 가져오는 함수'''
+    data = request.get_json()
+    username = data.get('username')
+    n = data.get('n')
+
+    # 유효성 검사
+    if not _username_check(conn, username):
+        return jsonify({'message': 'ID not found'}), 400
+    try:
+        n = int(n)
+    except:
+        return jsonify({'message': 'number error'}), 400
+    
+    # n만큼 main테이블에서 number 순으로 status가 '-1'인 단어 가져오기
+    with conn.cursor() as cursor:
+        cursor.execute("""
+            SELECT number, word FROM main 
+            WHERE username = %s AND status = '-1'
+            ORDER BY number ASC LIMIT %s
+            """, (username, n)
+        )
+        today_word = [(number, word) for number, word in cursor.fetchall()]
+
+    return jsonify({'add_word': today_word}), 200
 
 @app.route('/take_category', methods=['GET'])
 @handle_server_errors
@@ -187,7 +215,7 @@ def signup(conn):
         return jsonify({'message': 'language error'}), 400
     try:
         dayword = int(dayword)
-    except (ValueError, TypeError):
+    except:
         return jsonify({'message': 'dayword error'}), 400
     if not 10 <= dayword <= 25:
         return jsonify({'message': 'dayword error'}), 400
