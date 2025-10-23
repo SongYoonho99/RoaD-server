@@ -108,7 +108,7 @@ def login(conn):
                     ORDER BY number ASC LIMIT %s
                     """, (username, dayword)
                 )
-                today_word = [(number, word) for number, word in cursor.fetchall()]
+                today_word = [[number, word] for number, word in cursor.fetchall()]
             else:
                 today_word = []
 
@@ -178,7 +178,7 @@ def take_more_word(conn):
             ORDER BY number ASC LIMIT %s
             """, (username, n)
         )
-        today_word = [(number, word) for number, word in cursor.fetchall()]
+        today_word = [[number, word] for number, word in cursor.fetchall()]
 
     return jsonify({'add_word': today_word}), 200
 
