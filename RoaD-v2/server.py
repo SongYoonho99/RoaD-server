@@ -272,7 +272,7 @@ def take_more_word(conn):
     n = data.get('n')
 
     # 유효성 검사
-    if not _username_check(conn, username):
+    if not _is_user_exist(conn, username):
         return jsonify({'message': 'ID not found'}), 400
     try:
         n = int(n)
@@ -322,6 +322,9 @@ def create_word_category(conn):
 
     return jsonify({'message': f'{table_name} 테이블 생성 및 {len(words)}개 단어 삽입 완료'}), 200
 
+# ==============================
+# 서버 실행
+# ==============================
 if __name__ == '__main__':
     load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
     _load_db_config()
