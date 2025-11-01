@@ -31,7 +31,7 @@ def _load_db_config():
     name = os.getenv('ROAD2_DB_NAME')
 
 # ==============================
-# DB 관련 함수
+# DB 관련, 유틸 함수
 # ==============================
 def _get_connection():
     return pymysql.connect(host=host, user=user, password=password, database=name)
@@ -61,6 +61,10 @@ def _is_table_exist(conn, table):
     with conn.cursor() as cursor:
         cursor.execute("SHOW TABLES LIKE %s;", (table,))
         return cursor.fetchone() is not None
+
+def adjusted_date(dt):
+    '''오전 5시를 기준으로 하루를 계산하는 함수'''
+    return dt.date() if dt.hour >= 5 else (dt - timedelta(days=1)).date()
 
 # ==============================
 # Flask 앱 초기화
@@ -140,12 +144,11 @@ def sign_up(conn):
 
         if not is_add_yourself:
             cursor.execute(f"""
-                INSERT INTO main (username, number, word, status)
+                INSERT INTO main (username, number, word)
                 SELECT 
                     %s AS username,
                     (@rownum := @rownum + 1) AS number,
-                    w.word,
-                    '-1' AS status
+                    w.word
                 FROM (
                     SELECT word FROM {category} ORDER BY RAND()
                 ) AS w, (SELECT @rownum := 0) AS r;
@@ -203,21 +206,41 @@ def login(conn):
         row = cursor.fetchone()
         language, dayword, category = row
 
-        if category != 'add_yourself':
-            # main 테이블에서 number 순으로 dayword 개수만큼, status가 '-1'인 단어 가져오기
-            cursor.execute("""
-                SELECT number, word FROM main 
-                WHERE username = %s AND status = '-1'
-                ORDER BY number ASC LIMIT %s
-                """, (username, dayword)
+        if category != 'add yourself':
+            # 모든 단어가 status == finish인지 확인
+            cursor.execute(
+                "SELECT 1 FROM main WHERE username = %s AND status != 'finish' LIMIT 1", (username, )
             )
-            today_word = [[number, word] for number, word in cursor.fetchall()]
+            result = cursor.fetchone()
+            if not result:
+                return jsonify({'message': 'finish'}), 204
+
+            # status == retry인 단어 가져오기
+            cursor.execute("""
+                SELECT number, word FROM main
+                WHERE username = %s AND status = 'retry'
+                """, (username, )
+            )
+            retry_word = [[number, word] for number, word in cursor.fetchall()]
+            
+            # number 순으로 calculated_dayword 개수만큼, status가 yet인 단어 가져오기
+            calculated_dayword = dayword - len(retry_word)
+            if calculated_dayword > 0:
+                cursor.execute("""
+                    SELECT number, word FROM main 
+                    WHERE username = %s AND status = 'yet'
+                    ORDER BY number ASC LIMIT %s
+                    """, (username, calculated_dayword)
+                )
+                yet_word = [[number, word] for number, word in cursor.fetchall()]
+                today_word = retry_word + yet_word
+            else:
+                today_word = retry_word
         else:
             today_word = []
 
         cursor.execute(
-            "INSERT INTO record (username, start_time) VALUES (%s, NOW())",
-            (username,)
+            "INSERT INTO record (username, start_time) VALUES (%s, NOW())", (username, )
         )
 
         # record 로부터 (연속로그인일수) 혹은 (최초가입) 혹은 (오늘과정 이미끝) 파악
@@ -229,29 +252,20 @@ def login(conn):
         )
         row = cursor.fetchone()
 
-        # -2 : 최초로그인(로그인 기록이 없는 경우)
-        check_streak = -2
-
-        if row is not None:
+        if not row:
+            check_streak = False # False : 최초로그인(로그인 기록이 없는 경우)
+        else:
             start_time, streak = row
-
-            def adjusted_date(dt):
-                '''오전 5시를 기준으로 하루를 계산하는 함수'''
-                return dt.date() if dt.hour >= 5 else (dt - timedelta(days=1)).date()
 
             today = adjusted_date(datetime.now())
             last_login = adjusted_date(start_time)
 
             if last_login == today:
-                # -1 : 오늘 과정 이미 완료(로그인 기록이 오늘인 경우)
-                check_streak = -1
-
+                check_streak = True # True : 오늘 과정 이미 완료(로그인 기록이 오늘인 경우)
             elif last_login == today - timedelta(days=1):
-                # 1 <= : 연속 로그인 성공(로그인기록이 어제인 경우)
-                check_streak = streak
+                check_streak = streak + 1 # 며칠연속으로 로그인 했는지
             else:
-                # 0 : 연속 로그인 실패(로그인 기록이 어제보다 이전인 경우)
-                check_streak = 0
+                check_streak = -((today - last_login).days - 1) # 며칠연속으로 로그인 못했는지
 
         return jsonify({
             'language': language,
@@ -269,27 +283,34 @@ def login(conn):
 def take_more_word(conn):
     data = request.get_json()
     username = data.get('username')
-    n = data.get('n')
+    today_word = data.get('today_word')
+    necessary = data.get('necessary')
 
     # 유효성 검사
     if not _is_user_exist(conn, username):
         return jsonify({'message': 'ID not found'}), 400
     try:
-        n = int(n)
+        necessary = int(necessary)
     except:
         return jsonify({'message': 'number error'}), 400
+    try:
+        exclude = [int(num) for num, _ in today_word]
+    except:
+        return jsonify({'message': 'today_word format error'}), 400
+
+    placeholders = ','.join(['%s'] * len(exclude))
     
-    # n만큼 main테이블에서 number 순으로 status가 '-1'인 단어 가져오기
+    # n만큼 main테이블에서 number 순으로 status가 yet 인 단어 가져오기
     with conn.cursor() as cursor:
         cursor.execute("""
-            SELECT number, word FROM main 
-            WHERE username = %s AND status = '-1'
+            SELECT number, word FROM main
+            WHERE username = %s AND status = 'yet' AND number NOT IN (""" + placeholders + """)
             ORDER BY number ASC LIMIT %s
-            """, (username, n)
+            """, [username] + exclude + [necessary]
         )
-        today_word = [[number, word] for number, word in cursor.fetchall()]
+        added_word = [[number, word] for number, word in cursor.fetchall()]
 
-    return jsonify({'today_word': today_word}), 200
+    return jsonify({'added_word': added_word}), 200
 
 # ==============================
 # 프로그램 외부 호출 API 라우터
