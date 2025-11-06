@@ -1,8 +1,9 @@
 import os
 import re
+import json
 import logging
 from functools import wraps
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
@@ -33,6 +34,10 @@ def _load_db_config():
 # ==============================
 # DB 관련, 유틸 함수
 # ==============================
+def _adjusted_date(dt):
+    '''오전 5시를 기준으로 하루를 계산하는 함수'''
+    return dt.date() if dt.hour >= 5 else (dt - timedelta(days=1)).date()
+
 def _get_connection():
     return pymysql.connect(host=host, user=user, password=password, database=name)
 
@@ -62,9 +67,53 @@ def _is_table_exist(conn, table):
         cursor.execute("SHOW TABLES LIKE %s;", (table,))
         return cursor.fetchone() is not None
 
-def adjusted_date(dt):
-    '''오전 5시를 기준으로 하루를 계산하는 함수'''
-    return dt.date() if dt.hour >= 5 else (dt - timedelta(days=1)).date()
+def _is_word_in_main(conn, username, word_list):
+    if not word_list:
+        return False
+
+    numbers = [item[0] for item in word_list]
+    words   = [item[1] for item in word_list]
+
+    with conn.cursor() as cursor:
+        cursor.execute(f"""
+            SELECT number, word FROM main WHERE username = %s
+            AND number IN ({','.join(['%s'] * len(numbers))})
+            """, [username] + numbers
+        )
+        rows = cursor.fetchall()
+
+    db_set = {(row[0], row[1]) for row in rows}
+    local_set = {(n, w) for n, w in word_list}
+    return local_set.issubset(db_set)
+
+def _get_due_list(conn, username, field):
+    today = _adjusted_date(datetime.now())
+    with conn.cursor() as cursor:
+        cursor.execute(f"""
+            SELECT number, word, {field} FROM main
+            WHERE username = %s AND status = 'progress'
+            ORDER BY number DESC
+            """, (username,)
+        )
+        rows = cursor.fetchall()
+
+    result = []
+    date_groups = {}
+
+    for number, word, field_json in rows:
+        data = json.loads(field_json)
+        plan = data.get('plan')
+
+        plan_date = date.fromisoformat(plan)
+
+        if plan_date <= today and 'done' not in data:
+            date_groups.setdefault(plan, []).append([number, word])
+
+    for plan_date in sorted(date_groups.keys(), reverse=True):
+        result.append(plan_date)
+        result.extend(date_groups[plan_date])
+
+    return result
 
 # ==============================
 # Flask 앱 초기화
@@ -200,8 +249,7 @@ def login(conn):
 
     with conn.cursor() as cursor:
         cursor.execute(
-            "SELECT language, dayword, category FROM user WHERE username = %s",
-            (username,)
+            "SELECT language, dayword, category FROM user WHERE username = %s", (username, )
         )
         row = cursor.fetchone()
         language, dayword, category = row
@@ -257,8 +305,8 @@ def login(conn):
         else:
             start_time, streak = row
 
-            today = adjusted_date(datetime.now())
-            last_login = adjusted_date(start_time)
+            today = _adjusted_date(datetime.now())
+            last_login = _adjusted_date(start_time)
 
             if last_login == today:
                 check_streak = True # True : 오늘 과정 이미 완료(로그인 기록이 오늘인 경우)
@@ -313,6 +361,123 @@ def take_more_word(conn):
     return jsonify({'added_word': added_word}), 200
 
 # ==============================
+# write today word
+# ==============================
+@app.route('/write_today_word', methods=['POST'])
+@_db_request_wrapper
+def write_today_word(conn):
+    data = request.get_json()
+    username = data.get('username')
+    today_confirm = data.get('today_confirm')
+    today_mean = data.get('today_mean')
+    already_know = data.get('already_know')
+    is_add_yourself = data.get('is_add_yourself')
+
+    # 유효성 검사
+    if not _is_user_exist(conn, username):
+        return jsonify({'message': 'ID not found'}), 400
+    if not isinstance(is_add_yourself, bool):
+        return jsonify({'message': 'is_add_yourself error'}), 400
+    if len(today_confirm) > 25:
+        return jsonify({'message': 'today_confirm size error'}), 400
+    if not is_add_yourself and not _is_word_in_main(conn, username, today_confirm):
+        return jsonify({'message': 'today_confirm error'}), 400
+    if is_add_yourself and len(today_confirm) != len({w[0] for w in today_confirm}):
+        return jsonify({'message': 'today_confirm(add) error'}), 400
+    if [item[0] for item in today_mean] != [item[0] for item in today_confirm]:
+        return jsonify({'message': 'today_mean error'}), 400
+    if not is_add_yourself and not _is_word_in_main(conn, username, already_know):
+        return jsonify({'message': 'already_know error'}), 400
+    if is_add_yourself and already_know:
+        return  jsonify({'message': 'already_know(add) error'}), 400
+
+    # 오늘 날짜 및 반복 계획 JSON 구성
+    today = _adjusted_date(datetime.now())
+    plans = {
+        "first":  (today + timedelta(days=1)).strftime('%Y-%m-%d'),
+        "second": (today + timedelta(days=3)).strftime('%Y-%m-%d'),
+        "third":  (today + timedelta(days=7)).strftime('%Y-%m-%d'),
+        "fourth": (today + timedelta(days=14)).strftime('%Y-%m-%d'),
+        "fifth":  (today + timedelta(days=28)).strftime('%Y-%m-%d')
+    }
+
+    with conn.cursor() as cursor:
+        if not is_add_yourself:
+            # today_confirm 처리
+            for (num, _), (_, mean) in zip(today_confirm, today_mean):
+                cursor.execute("""
+                    UPDATE main
+                    SET mean = %s,
+                        status = 'progress',
+                        date_added = %s,
+                        first  = JSON_OBJECT('plan', %s),
+                        second = JSON_OBJECT('plan', %s),
+                        third  = JSON_OBJECT('plan', %s),
+                        fourth = JSON_OBJECT('plan', %s),
+                        fifth  = JSON_OBJECT('plan', %s)
+                    WHERE username = %s AND number = %s
+                    """, (
+                        mean,
+                        today.strftime('%Y-%m-%d'),
+                        plans['first'], plans['second'], plans['third'],
+                        plans['fourth'], plans['fifth'],
+                        username, num
+                    )
+                )
+
+            # already_know 처리
+            numbers = [item[0] for item in already_know]
+            cursor.execute(f"""
+                UPDATE main SET status = 'finish'
+                WHERE username = %s
+                    AND number IN ({','.join(['%s'] * len(numbers))})
+                """, [username] + numbers
+            )
+        else:
+            # 현재 username의 최대 number 값 조회
+            cursor.execute("SELECT MAX(number) FROM main WHERE username = %s", (username, ))
+            result = cursor.fetchone()
+            max_number = result[0] if result[0] is not None else 0  # 기존이 없으면 0부터 시작
+
+            # today_confirm 처리
+            for i, ((_, word), (_, mean)) in enumerate(zip(today_confirm, today_mean), start=1):
+                number = max_number + i  # 기존 최대값 + 1씩 증가
+                cursor.execute("""
+                    INSERT INTO main
+                    (username, number, word, mean, status, date_added,
+                    first, second, third, fourth, fifth)
+                    VALUES (%s, %s, %s, %s, 'progress', %s,
+                            JSON_OBJECT('plan', %s),
+                            JSON_OBJECT('plan', %s),
+                            JSON_OBJECT('plan', %s),
+                            JSON_OBJECT('plan', %s),
+                            JSON_OBJECT('plan', %s))
+                    """, (username, number, word, mean, today.strftime('%Y-%m-%d'),
+                        plans['first'], plans['second'], plans['third'],
+                        plans['fourth'], plans['fifth']
+                    )
+                )
+
+    return jsonify({'message': 'Successfully'}), 201
+
+# ==============================
+# get test data
+# ==============================
+@app.route('/get_test_data', methods=['POST'])
+@_db_request_wrapper
+def get_test_data(conn):
+    data = request.get_json()
+    username = data.get('username')
+
+    if not _is_user_exist(conn, username):
+        return jsonify({'message': 'ID not found'}), 400
+
+    fields = ['first', 'second', 'third', 'fourth', 'fifth']
+    result = {f: _get_due_list(conn, username, f) for f in fields}
+
+    return jsonify(result), 200
+
+# ==============================
 # 프로그램 외부 호출 API 라우터
 # ==============================
 @app.route('/create_word_category', methods=['POST'])
@@ -334,7 +499,7 @@ def create_word_category(conn):
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS `{table_name}` (
                 number INT PRIMARY KEY AUTO_INCREMENT,
-                word VARCHAR(20)
+                word VARCHAR(20) UNIQUE NOT NULL
             );
         """)
         cursor.executemany(
