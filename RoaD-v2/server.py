@@ -69,30 +69,36 @@ def _is_table_exist(conn, table):
 
 def _is_word_in_main(conn, username, word_list):
     if not word_list:
-        return False
+        # already_know 형식이면 True, today_confirm 형식이면 False
+        is_already_know = all(not isinstance(i, list) for i in word_list)
+        return True if is_already_know else False
 
-    numbers = [item[0] for item in word_list]
-    words   = [item[1] for item in word_list]
+    if isinstance(word_list[0], list):
+        word = [item[0] for item in word_list]
+    else:
+        word = word_list
 
     with conn.cursor() as cursor:
         cursor.execute(f"""
-            SELECT number, word FROM main WHERE username = %s
-            AND number IN ({','.join(['%s'] * len(numbers))})
-            """, [username] + numbers
+            SELECT word FROM main WHERE username = %s
+            AND word IN ({','.join(['%s'] * len(word))})
+            """, [username] + word
         )
         rows = cursor.fetchall()
 
-    db_set = {(row[0], row[1]) for row in rows}
-    local_set = {(n, w) for n, w in word_list}
-    return local_set.issubset(db_set)
+    db_word = {row[0] for row in rows}
+    if isinstance(word_list[0], list):
+        local_word = {w[0] for w in word_list}  # today_confirm 형식
+    else:
+        local_word = set(word_list)             # already_know 형식
+    return local_word.issubset(db_word)
 
 def _get_due_list(conn, username, field):
     today = _adjusted_date(datetime.now())
     with conn.cursor() as cursor:
         cursor.execute(f"""
-            SELECT number, word, {field} FROM main
+            SELECT word, mean, {field} FROM main
             WHERE username = %s AND status = 'progress'
-            ORDER BY number DESC
             """, (username,)
         )
         rows = cursor.fetchall()
@@ -100,14 +106,13 @@ def _get_due_list(conn, username, field):
     result = []
     date_groups = {}
 
-    for number, word, field_json in rows:
+    for word, mean, field_json in rows:
         data = json.loads(field_json)
         plan = data.get('plan')
-
         plan_date = date.fromisoformat(plan)
 
         if plan_date <= today and 'done' not in data:
-            date_groups.setdefault(plan, []).append([number, word])
+            date_groups.setdefault(plan, []).append([word, mean])
 
     for plan_date in sorted(date_groups.keys(), reverse=True):
         result.append(plan_date)
@@ -264,23 +269,20 @@ def login(conn):
                 return jsonify({'message': 'finish'}), 204
 
             # status == retry인 단어 가져오기
-            cursor.execute("""
-                SELECT number, word FROM main
-                WHERE username = %s AND status = 'retry'
-                """, (username, )
+            cursor.execute(
+                "SELECT word FROM main WHERE username = %s AND status = 'retry'", (username, )
             )
-            retry_word = [[number, word] for number, word in cursor.fetchall()]
+            retry_word = [row[0] for row in cursor.fetchall()]
             
             # number 순으로 calculated_dayword 개수만큼, status가 yet인 단어 가져오기
             calculated_dayword = dayword - len(retry_word)
             if calculated_dayword > 0:
                 cursor.execute("""
-                    SELECT number, word FROM main 
-                    WHERE username = %s AND status = 'yet'
+                    SELECT word FROM main WHERE username = %s AND status = 'yet'
                     ORDER BY number ASC LIMIT %s
                     """, (username, calculated_dayword)
                 )
-                yet_word = [[number, word] for number, word in cursor.fetchall()]
+                yet_word = [row[0] for row in cursor.fetchall()]
                 today_word = retry_word + yet_word
             else:
                 today_word = retry_word
@@ -296,7 +298,7 @@ def login(conn):
             SELECT start_time, streak FROM record
             WHERE username = %s AND status = 'o'
             ORDER BY number DESC LIMIT 1
-            """, (username,)
+            """, (username, )
         )
         row = cursor.fetchone()
 
@@ -341,22 +343,18 @@ def take_more_word(conn):
         necessary = int(necessary)
     except:
         return jsonify({'message': 'number error'}), 400
-    try:
-        exclude = [int(num) for num, _ in today_word]
-    except:
-        return jsonify({'message': 'today_word format error'}), 400
 
-    placeholders = ','.join(['%s'] * len(exclude))
+    placeholders = ','.join(['%s'] * len(today_word))
     
     # n만큼 main테이블에서 number 순으로 status가 yet 인 단어 가져오기
     with conn.cursor() as cursor:
-        cursor.execute("""
-            SELECT number, word FROM main
-            WHERE username = %s AND status = 'yet' AND number NOT IN (""" + placeholders + """)
+        cursor.execute(f"""
+            SELECT word FROM main
+            WHERE username = %s AND status = 'yet' AND word NOT IN ({placeholders})
             ORDER BY number ASC LIMIT %s
-            """, [username] + exclude + [necessary]
+            """, [username] + today_word + [necessary]
         )
-        added_word = [[number, word] for number, word in cursor.fetchall()]
+        added_word = [word[0] for word in cursor.fetchall()]
 
     return jsonify({'added_word': added_word}), 200
 
@@ -369,7 +367,6 @@ def write_today_word(conn):
     data = request.get_json()
     username = data.get('username')
     today_confirm = data.get('today_confirm')
-    today_mean = data.get('today_mean')
     already_know = data.get('already_know')
     is_add_yourself = data.get('is_add_yourself')
 
@@ -384,8 +381,6 @@ def write_today_word(conn):
         return jsonify({'message': 'today_confirm error'}), 400
     if is_add_yourself and len(today_confirm) != len({w[0] for w in today_confirm}):
         return jsonify({'message': 'today_confirm(add) error'}), 400
-    if [item[0] for item in today_mean] != [item[0] for item in today_confirm]:
-        return jsonify({'message': 'today_mean error'}), 400
     if not is_add_yourself and not _is_word_in_main(conn, username, already_know):
         return jsonify({'message': 'already_know error'}), 400
     if is_add_yourself and already_know:
@@ -394,17 +389,17 @@ def write_today_word(conn):
     # 오늘 날짜 및 반복 계획 JSON 구성
     today = _adjusted_date(datetime.now())
     plans = {
-        "first":  (today + timedelta(days=1)).strftime('%Y-%m-%d'),
-        "second": (today + timedelta(days=3)).strftime('%Y-%m-%d'),
-        "third":  (today + timedelta(days=7)).strftime('%Y-%m-%d'),
-        "fourth": (today + timedelta(days=14)).strftime('%Y-%m-%d'),
-        "fifth":  (today + timedelta(days=28)).strftime('%Y-%m-%d')
+        'first':  (today + timedelta(days=1)).strftime('%Y-%m-%d'),
+        'second': (today + timedelta(days=3)).strftime('%Y-%m-%d'),
+        'third':  (today + timedelta(days=7)).strftime('%Y-%m-%d'),
+        'fourth': (today + timedelta(days=14)).strftime('%Y-%m-%d'),
+        'fifth':  (today + timedelta(days=28)).strftime('%Y-%m-%d')
     }
 
     with conn.cursor() as cursor:
         if not is_add_yourself:
             # today_confirm 처리
-            for (num, _), (_, mean) in zip(today_confirm, today_mean):
+            for word, mean in today_confirm:
                 cursor.execute("""
                     UPDATE main
                     SET mean = %s,
@@ -415,24 +410,23 @@ def write_today_word(conn):
                         third  = JSON_OBJECT('plan', %s),
                         fourth = JSON_OBJECT('plan', %s),
                         fifth  = JSON_OBJECT('plan', %s)
-                    WHERE username = %s AND number = %s
+                    WHERE username = %s AND word = %s
                     """, (
                         mean,
                         today.strftime('%Y-%m-%d'),
                         plans['first'], plans['second'], plans['third'],
                         plans['fourth'], plans['fifth'],
-                        username, num
+                        username, word
                     )
                 )
 
             # already_know 처리
-            numbers = [item[0] for item in already_know]
-            cursor.execute(f"""
-                UPDATE main SET status = 'finish'
-                WHERE username = %s
-                    AND number IN ({','.join(['%s'] * len(numbers))})
-                """, [username] + numbers
-            )
+            if already_know:
+                cursor.execute(f"""
+                    UPDATE main SET status = 'finish' WHERE username = %s
+                    AND word IN ({','.join(['%s'] * len(already_know))})
+                    """, [username] + already_know
+                )
         else:
             # 현재 username의 최대 number 값 조회
             cursor.execute("SELECT MAX(number) FROM main WHERE username = %s", (username, ))
@@ -440,8 +434,8 @@ def write_today_word(conn):
             max_number = result[0] if result[0] is not None else 0  # 기존이 없으면 0부터 시작
 
             # today_confirm 처리
-            for i, ((_, word), (_, mean)) in enumerate(zip(today_confirm, today_mean), start=1):
-                number = max_number + i  # 기존 최대값 + 1씩 증가
+            for i, (word, mean) in enumerate(today_confirm, start=1):
+                number = max_number + i
                 cursor.execute("""
                     INSERT INTO main
                     (username, number, word, mean, status, date_added,
