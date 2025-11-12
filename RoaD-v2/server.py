@@ -95,7 +95,6 @@ def _is_word_in_main(conn, username, word_list):
 
 def _get_due_list(conn, username, field):
     today = _adjusted_date(datetime.now())
-    # TODO: 단어마다 단어를 등록한 날짜도 가져와야 함
     with conn.cursor() as cursor:
         cursor.execute(f"""
             SELECT word, mean, {field} FROM main
