@@ -90,7 +90,7 @@ def _is_word_in_main(conn, username, word_list):
     if isinstance(word_list[0], list):
         local_word = {w[0] for w in word_list}  # today_confirm 형식
     else:
-        local_word = set(word_list)             # already_know 형식
+        local_word = set(word_list)             # already_know, retry_word 형식
     return local_word.issubset(db_word)
 
 def _get_due_list(conn, username, field):
@@ -463,6 +463,7 @@ def get_test_data(conn):
     data = request.get_json()
     username = data.get('username')
 
+    # 유효성 검사
     if not _is_user_exist(conn, username):
         return jsonify({'message': 'ID not found'}), 400
 
@@ -470,6 +471,33 @@ def get_test_data(conn):
     result = {f: _get_due_list(conn, username, f) for f in fields}
 
     return jsonify(result), 200
+
+# ==============================
+# set retry word
+# ==============================
+@app.route('/set_retry_word', methods=['POST'])
+@_db_request_wrapper
+def set_retry_word(conn):
+    data = request.get_json()
+    username = data.get('username')
+    retry_word_list = data.get('retry_word_list')
+
+    if not retry_word_list:
+        return
+
+    # 유효성 검사
+    if not _is_user_exist(conn, username):
+        return jsonify({'message': 'ID not found'}), 400
+    if not _is_word_in_main(conn, username, retry_word_list):
+        return jsonify({'message': 'already_know error'}), 400
+
+    with conn.cursor() as cursor:
+        sql = f"""
+            UPDATE main SET status = 'retry',
+                mean = NULL, date_added = NULL, first = NULL, second = NULL, third = NULL, fourth = NULL, fifth = NULL
+            WHERE username = %s AND word IN ({','.join(['%s'] * len(retry_word_list))})
+        """
+        cursor.execute(sql, [username] + retry_word_list)
 
 # ==============================
 # 프로그램 외부 호출 API 라우터
