@@ -483,13 +483,13 @@ def set_retry_word(conn):
     retry_word_list = data.get('retry_word_list')
 
     if not retry_word_list:
-        return
+        return jsonify({'message': 'retry_word_list is None'}), 200
 
     # 유효성 검사
     if not _is_user_exist(conn, username):
         return jsonify({'message': 'ID not found'}), 400
     if not _is_word_in_main(conn, username, retry_word_list):
-        return jsonify({'message': 'already_know error'}), 400
+        return jsonify({'message': 'retry_word_list error'}), 400
 
     with conn.cursor() as cursor:
         sql = f"""
@@ -498,6 +498,8 @@ def set_retry_word(conn):
             WHERE username = %s AND word IN ({','.join(['%s'] * len(retry_word_list))})
         """
         cursor.execute(sql, [username] + retry_word_list)
+    
+    return jsonify({'message': 'set retry word successfully'}), 200
 
 # ==============================
 # 프로그램 외부 호출 API 라우터
