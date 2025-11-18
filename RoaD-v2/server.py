@@ -359,6 +359,24 @@ def take_more_word(conn):
     return jsonify({'added_word': added_word}), 200
 
 # ==============================
+# get test data
+# ==============================
+@app.route('/get_test_data', methods=['POST'])
+@_db_request_wrapper
+def get_test_data(conn):
+    data = request.get_json()
+    username = data.get('username')
+
+    # 유효성 검사
+    if not _is_user_exist(conn, username):
+        return jsonify({'message': 'ID not found'}), 400
+
+    fields = ['first', 'second', 'third', 'fourth', 'fifth']
+    result = {f: _get_due_list(conn, username, f) for f in fields}
+
+    return jsonify(result), 200
+
+# ==============================
 # write today word
 # ==============================
 @app.route('/write_today_word', methods=['POST'])
@@ -455,22 +473,96 @@ def write_today_word(conn):
     return jsonify({'message': 'Successfully'}), 201
 
 # ==============================
-# get test data
+# write test data
 # ==============================
-@app.route('/get_test_data', methods=['POST'])
+@app.route('/write_test_data', methods=['POST'])
 @_db_request_wrapper
-def get_test_data(conn):
+def write_test_data(conn):
     data = request.get_json()
     username = data.get('username')
+    test_word = data.get('test_word')
+    result_list = data.get('result_list')
+
+    if not _is_user_exist(conn, username):
+        return jsonify({'message': 'ID not found'}), 400
+    if not isinstance(test_word, list):
+        return jsonify({'message': 'test_word error'}), 400
+    if not isinstance(result_list, list) or not all(r in ('O', 'o', 'X', 'x') for r in result_list):
+        return jsonify({'message': 'result_list error'}), 400
+
+    test_word_pointer = 0
+    result_list_pointer = 0
+    while test_word_pointer < len(test_word):
+        current = test_word[test_word_pointer]
+
+        if current == 'today':
+            break
+
+        if isinstance(current, int):
+            if current == 5:
+                how_many_times = 'fifth'
+            elif current == 4:
+                how_many_times = 'fourth'
+            elif current == 3:
+                how_many_times = 'third'
+            elif current == 2:
+                how_many_times = 'second'
+            elif current == 1:
+                how_many_times = 'first'
+
+            test_word_pointer += 1
+            continue
+
+        if isinstance(current, str):
+            test_word_pointer += 1
+            continue
+        
+        if isinstance(current, list):
+            word_to_update = current[0]
+            today = _adjusted_date(datetime.now())
+            result = result_list[result_list_pointer].upper()
+            sql = f"""
+                UPDATE main
+                SET {how_many_times} = JSON_SET({how_many_times}, '$.done', %s, '$.result', %s)
+                WHERE username = %s AND word = %s
+            """
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (today, result, username, word_to_update))
+
+            test_word_pointer += 1
+            result_list_pointer += 1
+
+            continue
+        
+    return jsonify({'message': 'write test data successfully'}), 201
+
+# ==============================
+# write record
+# ==============================
+@app.route('/write_record', methods=['POST'])
+@_db_request_wrapper
+def write_record(conn):
+    data = request.get_json()
+    username = data.get('username')
+    streak = data.get('streak')
 
     # 유효성 검사
     if not _is_user_exist(conn, username):
         return jsonify({'message': 'ID not found'}), 400
+    if not (streak is False or isinstance(streak, int)):
+        return jsonify({'message': 'streak error'}), 400
 
-    fields = ['first', 'second', 'third', 'fourth', 'fifth']
-    result = {f: _get_due_list(conn, username, f) for f in fields}
+    if streak is False or streak <= 0:
+        streak = 1  # 최초 로그인 또는 연속로그인 끊김
 
-    return jsonify(result), 200
+    with conn.cursor() as cursor:
+        sql = """
+            UPDATE record SET end_time = %s, status = 'o', streak = %s
+            WHERE username = %s ORDER BY number DESC LIMIT 1
+        """
+        cursor.execute(sql, (datetime.now(), streak, username))
+    
+    return jsonify({'message': 'write record successfully'}), 200
 
 # ==============================
 # set retry word
