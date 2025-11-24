@@ -47,12 +47,12 @@ def _db_request_wrapper(func):
         conn = None
         try:
             with _get_connection() as conn:
-                result = func(conn, *args, **kwargs)  # 원래 함수 실행
+                result = func(conn, *args, **kwargs)
                 conn.commit()
                 return result
 
         except Exception as e:
-            logger.error(f"Exception in {func.__name__}: {e}", exc_info=True)
+            logger.error(f'Exception in {func.__name__}: {e}', exc_info=True)
             return jsonify({'message': 'Instance error.'}), 500
 
     return wrapper
@@ -266,7 +266,7 @@ def login(conn):
             )
             result = cursor.fetchone()
             if not result:
-                return jsonify({'message': 'finish'}), 204
+                return jsonify({'language': language, 'status': 'all'}), 200
 
             # status == retry인 단어 가져오기
             cursor.execute(
@@ -316,6 +316,9 @@ def login(conn):
                 check_streak = streak + 1 # 며칠연속으로 로그인 했는지
             else:
                 check_streak = -((today - last_login).days - 1) # 며칠연속으로 로그인 못했는지
+
+        if check_streak is True:
+            return jsonify({'language': language, 'status': 'today'}), 200
 
         return jsonify({
             'language': language,
@@ -449,7 +452,7 @@ def write_today_word(conn):
             # 현재 username의 최대 number 값 조회
             cursor.execute("SELECT MAX(number) FROM main WHERE username = %s", (username, ))
             result = cursor.fetchone()
-            max_number = result[0] if result[0] is not None else 0  # 기존이 없으면 0부터 시작
+            max_number = result[0] if result[0] is not None else 0
 
             # today_confirm 처리
             for i, (word, mean) in enumerate(today_confirm, start=1):
